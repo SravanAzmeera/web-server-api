@@ -6,6 +6,8 @@ const mongoose = require('mongoose');
 const url = require('url');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
+const multer = require('multer');
+const path = require('path');
 
 // Import JWT authentication utilities
 const {
@@ -25,6 +27,36 @@ const wss = new WebSocket.Server({ noServer: true });
 
 app.use(cors());
 app.use(express.json());
+
+
+//set up storage for uploaded files
+const upload = multer({
+  dest: path.join(__dirname, 'uploads'),
+  limits: { fileSize: 10 * 1024 * 1024 }, //  // 10 MB limit
+});
+
+
+//serve uploaded files statically
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// file upload endpoint
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ message: 'No file uploaded' });
+  }
+
+  //you can add more metadata here if needed
+  const fileUrl = `uploads/${req.file.filename}`;
+  res.json({
+    message: "file uploaded successfully",
+    fileUrl,
+    originalName: req.file.originalname,
+    mimetype: req.file.mimetype,
+  });
+});
+
+
+
 
 // SQLite database setup
 const db = new sqlite3.Database('./chat.db', (err) => {
@@ -146,7 +178,8 @@ server.on('upgrade', async (request, socket, head) => {
     console.log('WebSocket upgrade: user data:', user);
     if (!user) {
       console.error('WebSocket upgrade: Token verification failed');
-      socket.destroy(401, 'Unauthorized');
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
       return;
     }
 
@@ -154,7 +187,8 @@ server.on('upgrade', async (request, socket, head) => {
     const dbUser = await User.findOne({ email: user.email });
     if (!dbUser) {
       console.error('WebSocket upgrade: User not found in database');
-      socket.destroy(401, 'User not found');
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
       return;
     }
 
@@ -280,9 +314,9 @@ wss.on('connection', async (ws, req) => {
 
 // Message handling functions
 function handlePrivateMessage(senderWs, senderEmail, data) {
-  const { recipientEmail, message, timestamp } = data;
+  const { recipientEmail, message, timestamp, fileUrl, fileName, fileType } = data;
   
-  if (!recipientEmail || !message) {
+  if (!recipientEmail || (!message && !fileUrl)) {
     senderWs.send(JSON.stringify({ 
       type: 'message-error', 
       data: { 
@@ -296,14 +330,17 @@ function handlePrivateMessage(senderWs, senderEmail, data) {
   const messageData = { 
     from: senderEmail, 
     to: recipientEmail, 
-    message, 
+    message: message || '', 
     timestamp: timestamp || new Date().toISOString(), 
-    isRead: false 
+    isRead: false,
+    fileUrl: fileUrl || null,
+    fileName: fileName || null,
+    fileType: fileType || null
   };
 
   db.run(
-    'INSERT INTO messages ("from", "to", message, timestamp, isRead) VALUES (?, ?, ?, ?, ?)',
-    [senderEmail, recipientEmail, message, messageData.timestamp, 0],
+    'INSERT INTO messages ("from", "to", message, timestamp, isRead, fileUrl, fileName, fileType) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [senderEmail, recipientEmail, messageData.message, messageData.timestamp, 0, messageData.fileUrl, messageData.fileName, messageData.fileType],
     (err) => {
       if (err) {
         console.error('Message save error:', err);
@@ -320,7 +357,7 @@ function handlePrivateMessage(senderWs, senderEmail, data) {
           type: 'message-error', 
           data: { 
             to: recipientEmail, 
-            message, 
+            message:messageData.message,
             error: 'User is not online', 
             timestamp: new Date().toISOString() 
           } 
