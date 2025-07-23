@@ -32,7 +32,8 @@ app.use(express.json());
 //set up storage for uploaded files
 const upload = multer({
   dest: path.join(__dirname, 'uploads'),
-  limits: { fileSize: 10 * 1024 * 1024 }, //  // 10 MB limit
+  // limits: { fileSize: 10 * 1024 * 1024 }, //  // 10 MB limit
+  limits: { fileSize: 5 * 1024 * 1024 * 1024 }, // 5 GB limit
 });
 
 
@@ -546,12 +547,18 @@ app.post('/api/refresh-token', async (req, res) => {
       return res.status(401).json({ message: 'Invalid or expired refresh token' });
     }
 
-    // Generate new access token
-    const newTokens = refreshAccessToken(refreshToken);
-    
+    // Fetch user from MongoDB to get username
+    const user = await User.findOne({ email: tokenExists.email, isActive: true });
+    if (!user) {
+      return res.status(401).json({ message: 'User not found for refresh token' });
+    }
+
+    // Generate new access token with both email and username
+    const tokens = generateTokens({ email: user.email, username: user.username });
+
     res.json({
-      accessToken: newTokens.accessToken,
-      expiresIn: newTokens.expiresIn
+      accessToken: tokens.accessToken,
+      expiresIn: tokens.expiresIn
     });
   } catch (error) {
     console.error('Token refresh error:', error);
