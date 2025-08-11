@@ -1,3 +1,4 @@
+
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -8,6 +9,7 @@ const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
 
 // Import JWT authentication utilities
 const {
@@ -22,55 +24,128 @@ const {
 const app = express();
 const server = http.createServer(app);
 
-// WebSocket server setup (remove verifyClient)
+const uploadsDir = path.join(__dirname, 'uploads');
+
+// Create uploads directory if it doesn't exist
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// WebSocket server setup
 const wss = new WebSocket.Server({ noServer: true });
 
 app.use(cors());
 app.use(express.json());
 
-
-//set up storage for uploaded files
+// Set up storage for uploaded files
 const upload = multer({
   dest: path.join(__dirname, 'uploads'),
-  // limits: { fileSize: 10 * 1024 * 1024 }, //  // 10 MB limit
   limits: { fileSize: 5 * 1024 * 1024 * 1024 }, // 5 GB limit
 });
 
-
-//serve uploaded files statically
+// Serve uploaded files statically
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// file upload endpoint
-app.post('/api/upload', upload.single('file'), (req, res) => {
+// File upload endpoint
+app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: 'No file uploaded' });
   }
 
-  //you can add more metadata here if needed
   const fileUrl = `uploads/${req.file.filename}`;
   res.json({
-    message: "file uploaded successfully",
+    message: "File uploaded successfully",
     fileUrl,
     originalName: req.file.originalname,
     mimetype: req.file.mimetype,
+    size: req.file.size
   });
 });
 
+// Delete files from server after local storage
+app.delete('/api/delete-file/:filename', authenticateToken, (req, res) => {
+  const { filename } = req.params;
+  const filePath = path.join(uploadsDir, filename);
 
+  fs.unlink(filePath, (err) => {
+    if (err) {
+      console.error('File deletion error:', err);
+      if (err.code === 'ENOENT') {
+        // File doesn't exist, consider it already deleted
+        return res.json({ message: 'File already deleted or does not exist' });
+      }
+      return res.status(500).json({ message: 'Failed to delete file' });
+    }
+    console.log('File deleted successfully:', filename);
+    res.json({ message: 'File deleted successfully' });
+  });
+});
 
+// Cleanup old files endpoint (optional - for maintenance)
+app.post('/api/cleanup-old-files', authenticateToken, (req, res) => {
+  const cutoffTime = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
+  
+  fs.readdir(uploadsDir, (err, files) => {
+    if (err) {
+      return res.status(500).json({ message: 'Error reading uploads directory' });
+    }
+    
+    let deletedCount = 0;
+    let totalFiles = files.length;
+    
+    if (totalFiles === 0) {
+      return res.json({ message: 'No files to cleanup', deletedCount: 0 });
+    }
+    
+    files.forEach((file) => {
+      const filePath = path.join(uploadsDir, file);
+      fs.stat(filePath, (err, stats) => {
+        if (err) return;
+        
+        if (stats.mtimeMs < cutoffTime) {
+          fs.unlink(filePath, (err) => {
+            if (!err) deletedCount++;
+            totalFiles--;
+            if (totalFiles === 0) {
+              res.json({ message: `Cleanup completed. Deleted ${deletedCount} old files.`, deletedCount });
+            }
+          });
+        } else {
+          totalFiles--;
+          if (totalFiles === 0) {
+            res.json({ message: `Cleanup completed. Deleted ${deletedCount} old files.`, deletedCount });
+          }
+        }
+      });
+    });
+  });
+});
 
-// SQLite database setup
+// SQLite database setup with updated schema
 const db = new sqlite3.Database('./chat.db', (err) => {
   if (err) console.error('SQLite error:', err.message);
   else {
+    // Updated messages table to include file fields
     db.run(`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       "from" TEXT, 
       "to" TEXT, 
       message TEXT, 
       timestamp TEXT, 
-      isRead INTEGER DEFAULT 0
-    )`);
+      isRead INTEGER DEFAULT 0,
+      fileUrl TEXT NULL,
+      fileName TEXT NULL,
+      fileType TEXT NULL
+    )`, (err) => {
+      if (err) {
+        console.error('Error creating messages table:', err);
+      } else {
+        // Add new columns to existing table if they don't exist
+        db.run(`ALTER TABLE messages ADD COLUMN fileUrl TEXT NULL`, () => {});
+        db.run(`ALTER TABLE messages ADD COLUMN fileName TEXT NULL`, () => {});
+        db.run(`ALTER TABLE messages ADD COLUMN fileType TEXT NULL`, () => {});
+      }
+    });
     
     db.run(`CREATE TABLE IF NOT EXISTS refresh_tokens (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -321,7 +396,7 @@ function handlePrivateMessage(senderWs, senderEmail, data) {
     senderWs.send(JSON.stringify({ 
       type: 'message-error', 
       data: { 
-        error: 'Missing recipient email or message', 
+        error: 'Missing recipient email or message content', 
         timestamp: new Date().toISOString() 
       } 
     }));
@@ -339,29 +414,42 @@ function handlePrivateMessage(senderWs, senderEmail, data) {
     fileType: fileType || null
   };
 
+  // Save message to database with file information
   db.run(
     'INSERT INTO messages ("from", "to", message, timestamp, isRead, fileUrl, fileName, fileType) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [senderEmail, recipientEmail, messageData.message, messageData.timestamp, 0, messageData.fileUrl, messageData.fileName, messageData.fileType],
     (err) => {
       if (err) {
         console.error('Message save error:', err);
+        senderWs.send(JSON.stringify({ 
+          type: 'message-error', 
+          data: { 
+            error: 'Failed to save message', 
+            timestamp: new Date().toISOString() 
+          } 
+        }));
         return;
       }
       
+      console.log('Message saved:', {
+        from: senderEmail,
+        to: recipientEmail,
+        hasText: !!message,
+        hasFile: !!fileUrl,
+        fileName: fileName
+      });
+      
+      // Try to deliver to recipient
       if (sendToUser(recipientEmail, { type: 'private-message', data: messageData })) {
         senderWs.send(JSON.stringify({ 
           type: 'message-sent', 
           data: { ...messageData, status: 'delivered' } 
         }));
       } else {
+        // Recipient is offline, message is saved and will be delivered when they connect
         senderWs.send(JSON.stringify({ 
-          type: 'message-error', 
-          data: { 
-            to: recipientEmail, 
-            message:messageData.message,
-            error: 'User is not online', 
-            timestamp: new Date().toISOString() 
-          } 
+          type: 'message-sent', 
+          data: { ...messageData, status: 'saved' } 
         }));
       }
     }
@@ -620,10 +708,12 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     timestamp: new Date().toISOString(), 
-    connectedUsers: connectedUsers.size 
+    connectedUsers: connectedUsers.size,
+    uploadsDir: uploadsDir
   });
 });
 
+// Get message history with file information
 app.get('/api/messages', authenticateToken, (req, res) => {
   const userEmail = req.user.email;
   db.all(
@@ -634,9 +724,33 @@ app.get('/api/messages', authenticateToken, (req, res) => {
         console.error('Message fetch error:', err);
         return res.status(500).json({ message: 'Server error' });
       }
+      console.log(`Fetched ${rows.length} messages for user: ${userEmail}`);
       res.json({ messages: rows });
     }
   );
+});
+
+// Get file information (optional endpoint)
+app.get('/api/file-info/:filename', authenticateToken, (req, res) => {
+  const { filename } = req.params;
+  const filePath = path.join(uploadsDir, filename);
+  
+  fs.stat(filePath, (err, stats) => {
+    if (err) {
+      if (err.code === 'ENOENT') {
+        return res.status(404).json({ message: 'File not found' });
+      }
+      return res.status(500).json({ message: 'File access error' });
+    }
+    
+    res.json({
+      filename,
+      size: stats.size,
+      created: stats.birthtime,
+      modified: stats.mtime,
+      exists: true
+    });
+  });
 });
 
 // Start server
@@ -645,4 +759,5 @@ server.listen(PORT, () => {
   console.log(`WebSocket server running on port ${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}?token=your-jwt-token`);
   console.log(`HTTP API available at: http://localhost:${PORT}/api`);
+  console.log(`Uploads directory: ${uploadsDir}`);
 });
