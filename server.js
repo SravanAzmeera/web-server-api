@@ -57,7 +57,7 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
     return res.status(400).json({ message: 'No file uploaded' });
   }
 
-  const fileUrl = `uploads/${req.file.filename}`;
+ const fileUrl = `${process.env.API_URL || 'https://web-server-api.onrender.com'}/uploads/${req.file.filename}`;
   res.json({
     message: "File uploaded successfully",
     fileUrl,
